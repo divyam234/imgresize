@@ -31,6 +31,97 @@ the installed libvips has the encoder). Dimensions default to 300×300, quality
 to 80, and fit to `cover`; `contain`, `inside`, `outside` and `fill` are accepted.
 `f` aliases `format`, with explicit `format` taking precedence.
 
+## Docker
+
+```sh
+docker build --pull -t imgresize:latest .
+docker run -d --name imgresize -p 8080:8080 \
+  --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --cap-drop ALL --security-opt no-new-privileges \
+  --cpus=2 --memory=512m --pids-limit=256 \
+  -e RESIZE_WORKERS=2 -e CACHE_MAX_SIZE=64MiB \
+  -e CACHE_TTL_SECONDS=300 -e CACHE_CLEANUP_SECONDS=30 imgresize:latest
+curl -fsS http://localhost:8080/health
+docker stop --time=30 imgresize
+```
+
+Both stages use `alpine:latest`. The builder installs Alpine's Zig package, runs
+the real-server integration suite, then builds a stripped, baseline-CPU
+`ReleaseFast` executable. The runtime contains only the service and runtime
+packages: libvips, its HEIF module, the AV1 encoder, and HTTPS CA certificates.
+It runs as UID 1000 and GID 100 (`users`), with an exec-form entrypoint for SIGTERM shutdown and
+a health check that respects `PORT`. No compiler, headers, benchmark, source,
+or build cache is copied into the runtime image.
+
+Pass the environment variables below with `-e`. Changing `PORT` also requires
+changing the container-side published port. CPU and memory flags enforce limits;
+worker counts alone do not. Outbound network restrictions and authentication
+remain necessary for untrusted callers.
+
+`latest` and Alpine packages are mutable: rebuild with `--pull` for updates.
+This source requires Zig 0.16.x; a future Alpine Zig upgrade may require a source
+migration. For Podman, configure `docker.io` as an unqualified-search registry
+so `alpine:latest` resolves.
+
+### GitHub container images
+
+The publication workflow builds `linux/amd64` and `linux/arm64` on separate native
+runner matrix jobs, runs the Dockerfile's tests on each architecture, and merges
+their pushed digests into a single GHCR image. No persistent build cache is used.
+
+```sh
+docker pull ghcr.io/divyam234/imgresize:latest
+docker run -d --name imgresize -p 8080:8080 \
+  -e CACHE_MAX_SIZE=64MiB ghcr.io/divyam234/imgresize:latest
+```
+
+Pushes to `main` and manual runs publish only `latest`; Git tag pushes do not
+trigger publication. Each platform is pushed by digest first; `latest` is updated
+only after both builds succeed.
+
+Actions use the latest stable major versions checked when this workflow was added:
+checkout v7, upload-artifact v7, download-artifact v8, Buildx v4, login v4,
+metadata v6, and build-push v7. `GITHUB_TOKEN` authenticates GHCR with job-scoped
+`packages: write`; no separate registry secret is required.
+
+The repository is public. GHCR package visibility is managed separately: if an
+anonymous pull is denied after the first publication, set the package's visibility
+to public in GitHub package settings, or authenticate with `docker login ghcr.io`.
+
+## Resized-image cache
+
+The optional in-memory LRU cache stores successful encoded resize results, not
+source images or libvips operation graphs. Enable it with `CACHE_MAX_SIZE`.
+
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `CACHE_MAX_SIZE` | 0 | Maximum cache allocation bytes; e.g. `64MiB` or `512MB`; 0 disables caching, maximum `8GiB` |
+| `CACHE_TTL_SECONDS` | 300 | Absolute lifetime from insertion; hits do not extend expiration |
+| `CACHE_CLEANUP_SECONDS` | 30 | Interval between expired-entry cleanup passes |
+
+Sizes accept nonnegative whole numbers with `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`
+or `GiB` (case-insensitive), or raw bytes without a suffix. Decimal units use
+powers of 1000; binary units use powers of 1024. Fractions and unknown units are
+rejected at startup. TTL and cleanup intervals are positive whole seconds.
+
+The cleaner starts with the service when caching is enabled and first runs after
+one cleanup interval. Lookups reject expired entries immediately, even before the
+next pass. Hits promote entries to most-recently-used; admission evicts the
+least-recently-used entries when space is needed. Oversized results are served
+without caching. Only successful results are cached.
+
+Keys include the source URL and normalized width, height, fit, format and quality.
+Equivalent parameter ordering, defaults and aliases share a result; distinct
+resize options do not. Hits skip origin downloads, decoding and encoding.
+Requests already reading an entry can finish safely if it expires or is evicted;
+their retained buffers still count toward the cache limit.
+
+Cache capacity is separate from `BUFFER_MEMORY_MB`, and includes retained payloads
+and entry metadata. Neither is a total RSS limit: budget for both, decoder scratch
+space, allocator overhead and HTTP workers. The cache is process-local, empty
+after restart, and does not revalidate source changes before TTL expiry. This TTL
+controls the server's memory cache, not downstream HTTP caches.
+
 ## Concurrency and memory
 
 A bounded queue accepts concurrent clients while a fixed group of HTTP workers
@@ -172,6 +263,12 @@ also exercised.
 
 ## Changes
 
+- Added an `alpine:latest` multi-stage Docker build, non-root runtime, health
+  check, AVIF encoder and HTTPS certificate bundle.
+- Added native amd64/arm64 GitHub Actions matrix publication to GHCR with a
+  merged multi-architecture manifest and major-version action references.
+- Added configurable, byte-bounded resized-response LRU caching with absolute
+  TTL, periodic expiration cleanup and zero-copy response leases.
 - Replaced the C application and libcurl/libmicrohttpd HTTP paths with idiomatic
   Zig and native HTTP/I/O while retaining the libvips image engine.
 - Replaced Python load testing with a native Zig benchmark and real-server tests.

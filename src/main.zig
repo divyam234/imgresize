@@ -3,6 +3,7 @@ const Io = std.Io;
 const Budget = @import("budget.zig").Budget;
 const image = @import("resize.zig");
 const fetch = @import("fetch.zig");
+const response_cache = @import("cache.zig");
 
 const Config = struct {
     port: u16,
@@ -12,6 +13,9 @@ const Config = struct {
     source_bytes: usize,
     buffer_bytes: usize,
     pixels: usize,
+    cache_bytes: usize,
+    cache_ttl_seconds: usize,
+    cache_cleanup_seconds: usize,
     vips_concurrency: c_int,
 
     fn load(env: *const std.process.Environ.Map) !Config {
@@ -23,6 +27,9 @@ const Config = struct {
             .source_bytes = (try number(env, "MAX_BODY_MB", 50, 1024)) * 1024 * 1024,
             .buffer_bytes = (try number(env, "BUFFER_MEMORY_MB", 128, 8192)) * 1024 * 1024,
             .pixels = try number(env, "MAX_PIXELS", 40000000, std.math.maxInt(c_int)),
+            .cache_bytes = try cacheSize(env.get("CACHE_MAX_SIZE") orelse "0"),
+            .cache_ttl_seconds = try number(env, "CACHE_TTL_SECONDS", 300, std.math.maxInt(i64)),
+            .cache_cleanup_seconds = try number(env, "CACHE_CLEANUP_SECONDS", 30, std.math.maxInt(i64)),
             .vips_concurrency = @intCast(try number(env, "VIPS_CONCURRENCY", 1, 128)),
         };
     }
@@ -35,11 +42,47 @@ const Config = struct {
         return value;
     }
 
+    fn cacheSize(text: []const u8) !usize {
+        return parseCacheSize(text) catch {
+            std.log.err("invalid CACHE_MAX_SIZE (expected 0..8GiB, e.g. 64MiB or 512MB)", .{});
+            return error.InvalidConfiguration;
+        };
+    }
+
     fn invalid(name: []const u8, maximum: usize) error{InvalidConfiguration} {
         std.log.err("invalid {s} (expected 1..{d})", .{ name, maximum });
         return error.InvalidConfiguration;
     }
 };
+
+fn parseCacheSize(text: []const u8) error{InvalidSize}!usize {
+    const value = std.mem.trim(u8, text, " \t\r\n");
+    if (value.len == 0) return 0;
+    var end: usize = 0;
+    while (end < value.len and std.ascii.isDigit(value[end])) : (end += 1) {}
+    if (end == 0) return error.InvalidSize;
+    const amount = std.fmt.parseInt(usize, value[0..end], 10) catch return error.InvalidSize;
+    const unit = std.mem.trim(u8, value[end..], " \t");
+    const multiplier: usize = if (unit.len == 0 or std.ascii.eqlIgnoreCase(unit, "B"))
+        1
+    else if (std.ascii.eqlIgnoreCase(unit, "KB"))
+        1000
+    else if (std.ascii.eqlIgnoreCase(unit, "MB"))
+        1000 * 1000
+    else if (std.ascii.eqlIgnoreCase(unit, "GB"))
+        1000 * 1000 * 1000
+    else if (std.ascii.eqlIgnoreCase(unit, "KiB"))
+        1024
+    else if (std.ascii.eqlIgnoreCase(unit, "MiB"))
+        1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(unit, "GiB"))
+        1024 * 1024 * 1024
+    else
+        return error.InvalidSize;
+    const maximum: usize = 8 * 1024 * 1024 * 1024;
+    if (amount > maximum / multiplier) return error.InvalidSize;
+    return amount * multiplier;
+}
 
 const Job = struct {
     stream: Io.net.Stream,
@@ -50,6 +93,7 @@ const Service = struct {
     io: Io,
     config: Config,
     budget: Budget,
+    cache: response_cache.Cache,
     slots: Io.Semaphore,
     client: std.http.Client,
     queue: Io.Queue(Job),
@@ -95,6 +139,13 @@ const Service = struct {
         }
     }
 
+    fn cleanCache(self: *Service) Io.Cancelable!void {
+        while (true) {
+            try Io.sleep(self.io, .fromSeconds(@intCast(self.config.cache_cleanup_seconds)), .awake);
+            self.cache.cleanup(cacheNow(self.io));
+        }
+    }
+
     fn serve(self: *Service, stream: Io.net.Stream) !void {
         var read_buffer: [8192]u8 = undefined;
         var write_buffer: [4096]u8 = undefined;
@@ -122,6 +173,12 @@ const Service = struct {
         if (source_url.len == 0)
             return respond(&request, .bad_request, "missing url parameter\n", "text/plain", false);
         const options = parameters.options();
+        const key = if (self.config.cache_bytes != 0) response_cache.keyFor(source_url, options) else [_]u8{0} ** 32;
+        if (if (self.config.cache_bytes != 0) self.cache.get(key, cacheNow(self.io)) else null) |cached| {
+            var lease = cached;
+            defer lease.deinit();
+            return respond(&request, .ok, lease.bytes(), options.format.contentType(), true);
+        }
 
         var source = fetch.download(&self.client, source_url, self.config.source_bytes, &self.budget) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
@@ -137,16 +194,22 @@ const Service = struct {
             break :blk image.resize(source.bytes(), options, self.config.pixels);
         };
         source.deinit();
-        var encoded = resized catch {
+        var encoded: ?image.Encoded = resized catch {
             image.vips.vips_error_clear();
             return respond(&request, .bad_request, "decode/resize failed or exceeded pixel limit\n", "text/plain", false);
         };
-        defer encoded.deinit();
+        defer if (encoded) |*owned| owned.deinit();
         try self.io.checkCancel();
-        if (!self.budget.reserve(encoded.bytes.len))
+        if (if (self.config.cache_bytes != 0) self.cache.insert(key, &encoded.?, cacheNow(self.io)) else null) |cached| {
+            encoded = null;
+            var lease = cached;
+            defer lease.deinit();
+            return respond(&request, .ok, lease.bytes(), options.format.contentType(), true);
+        }
+        if (!self.budget.reserve(encoded.?.bytes.len))
             return respond(&request, .service_unavailable, "response memory budget exhausted; retry later\n", "text/plain", false);
-        defer self.budget.release(encoded.bytes.len);
-        try respond(&request, .ok, encoded.bytes, options.format.contentType(), true);
+        defer self.budget.release(encoded.?.bytes.len);
+        try respond(&request, .ok, encoded.?.bytes, options.format.contentType(), true);
     }
 };
 
@@ -235,6 +298,10 @@ fn respond(request: *std.http.Server.Request, status: std.http.Status, body: []c
     });
 }
 
+fn cacheNow(io: Io) i96 {
+    return Io.Clock.Timestamp.now(io, .awake).raw.toNanoseconds();
+}
+
 fn deadlineAfter(io: Io, seconds: i64) Io.Clock.Timestamp {
     return Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .clock = .awake, .raw = .fromSeconds(seconds) });
 }
@@ -291,12 +358,14 @@ pub fn main(init: std.process.Init) !void {
     var service: Service = .{
         .io = io,
         .config = config,
+        .cache = try response_cache.Cache.init(allocator, io, config.cache_bytes, config.cache_ttl_seconds),
         .budget = .{ .limit = config.buffer_bytes },
         .slots = .{ .permits = config.resize_workers },
         .client = .{ .allocator = allocator, .io = io, .connection_pool = .{ .free_size = config.http_workers } },
         .queue = .init(queue_storage),
     };
     defer service.client.deinit();
+    defer service.cache.deinit();
     defer std.debug.assert(service.budget.used.load(.monotonic) == 0);
     var workers: Io.Group = .init;
     defer {
@@ -310,6 +379,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.assert(service.connections.load(.monotonic) == 0);
     }
     for (0..config.http_workers) |_| try workers.concurrent(io, Service.worker, .{&service});
+    if (config.cache_bytes != 0) try workers.concurrent(io, Service.cleanCache, .{&service});
 
     const Completion = union(enum) { stopped: anyerror!void, serve: anyerror!void };
     var results: [2]Completion = undefined;
@@ -361,4 +431,26 @@ test "dimensions and quality retain bounded fallback behavior" {
     try std.testing.expectEqual(@as(u32, 400), options.height);
     try std.testing.expectEqual(@as(u8, 100), options.quality);
     try std.testing.expectEqual(image.Format.webp, options.format);
+}
+
+test "cache keys normalize defaults aliases parameter order and fallbacks" {
+    var left_storage: [1024]u8 = undefined;
+    var right_storage: [1024]u8 = undefined;
+    const left = try Parameters.parse("url=https%3A%2F%2Fexample.com%2Fa", &left_storage);
+    const right = try Parameters.parse("q=80&fit=COVER&h=300&w=300&f=JPEG&url=https%3A%2F%2Fexample.com%2Fa", &right_storage);
+    try std.testing.expectEqual(response_cache.keyFor(left.url.?, left.options()), response_cache.keyFor(right.url.?, right.options()));
+    const fallback = (Parameters{ .width = "bad", .height = "0", .quality = "bad", .format = "unknown", .fit = "unknown" }).options();
+    try std.testing.expectEqual(response_cache.keyFor(left.url.?, left.options()), response_cache.keyFor(left.url.?, fallback));
+}
+
+test "human-readable cache sizes distinguish decimal and binary units and reject overflow" {
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), try parseCacheSize("64MiB"));
+    try std.testing.expectEqual(@as(usize, 512000000), try parseCacheSize("512MB"));
+    try std.testing.expectEqual(@as(usize, 1024), try parseCacheSize(" 1 kib "));
+    try std.testing.expectEqual(@as(usize, 4096), try parseCacheSize("4096"));
+    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), try parseCacheSize("8GiB"));
+    try std.testing.expectEqual(@as(usize, 0), try parseCacheSize("0B"));
+    for ([_][]const u8{ "-1MiB", "1.5GB", "64MIB junk", "9GiB", "8589934593B", "18446744073709551616", "18446744073709551615GB", "MiB" }) |invalid| {
+        try std.testing.expectError(error.InvalidSize, parseCacheSize(invalid));
+    }
 }
