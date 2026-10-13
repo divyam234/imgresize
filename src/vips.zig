@@ -16,6 +16,8 @@ pub extern fn vips_cache_set_max_mem(bytes: usize) void;
 pub extern fn vips_concurrency_set(count: c_int) void;
 pub extern fn vips_image_get_width(image: *const Image) c_int;
 pub extern fn vips_image_get_height(image: *const Image) c_int;
+pub extern fn vips_image_get_orientation(image: *const Image) c_int;
+pub extern fn vips_image_set_int(image: *Image, name: [*:0]const u8, value: c_int) void;
 pub extern fn vips_image_new_from_buffer(data: *const anyopaque, len: usize, options: [*:0]const u8, ...) ?*Image;
 pub extern fn vips_image_new_from_memory(data: *const anyopaque, size: usize, width: c_int, height: c_int, bands: c_int, format: c_int) ?*Image;
 pub extern fn vips_thumbnail_buffer(data: *anyopaque, len: usize, output: *?*Image, width: c_int, ...) c_int;

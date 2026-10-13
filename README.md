@@ -10,9 +10,11 @@ Requires Linux, Zig 0.16.x, libvips with its codecs, and `pkg-config`. The small
 application logic uses Zig ownership, error unions, and deferred cleanup.
 
 ```sh
-nix-shell --run 'make && ./zig-out/bin/imgresize'
+direnv allow
+direnv exec . make
+direnv exec . ./zig-out/bin/imgresize
 # Equivalent build:
-nix-shell --run 'zig build -Doptimize=ReleaseFast'
+direnv exec . zig build -Doptimize=ReleaseFast
 ```
 
 URL-encode the source, including its query string:
@@ -31,12 +33,26 @@ the installed libvips has the encoder). Dimensions default to 300×300, quality
 to 80, and fit to `cover`; `contain`, `inside`, `outside` and `fill` are accepted.
 `f` aliases `format`, with explicit `format` taking precedence.
 
+Width defaults to `w=300`; omitted `h` defaults to the normalized width.
+Only an **explicit zero** opts an axis out: `w=80&h=0&fit=inside` bounds the
+displayed width to 80 while preserving aspect ratio (a portrait's height can
+exceed 80); `w=0&h=60&fit=inside` bounds the displayed height to 60. EXIF
+autorotation is applied before interpreting these axes. `inside` and `contain`
+do not enlarge smaller sources. With one unconstrained axis, `cover` and `fill`
+also preserve aspect ratio rather than cropping or stretching. Both axes zero
+return HTTP 400; `w=80` alone still uses an 80×80 target. Positive parameters
+retain the existing 8192 bound and invalid-value fallback; the derived
+unconstrained dimension has no arbitrary axis cap, but source, resolved target
+and actual output must all satisfy `MAX_PIXELS`. Cache keys distinguish explicit
+zero axes from ordinary two-axis targets.
+
 ## Docker
 
 ```sh
 docker build --pull -t imgresize:latest .
 docker run -d --name imgresize -p 8080:8080 \
   --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+  --mount type=volume,src=imgresize-cache,dst=/var/cache/images \
   --cap-drop ALL --security-opt no-new-privileges \
   --cpus=2 --memory=512m --pids-limit=256 \
   -e RESIZE_WORKERS=2 -e CACHE_MAX_SIZE=64MiB \
@@ -72,6 +88,7 @@ their pushed digests into a single GHCR image. No persistent build cache is used
 ```sh
 docker pull ghcr.io/divyam234/imgresize:latest
 docker run -d --name imgresize -p 8080:8080 \
+  --mount type=volume,src=imgresize-cache,dst=/var/cache/images \
   -e CACHE_MAX_SIZE=64MiB ghcr.io/divyam234/imgresize:latest
 ```
 
@@ -90,37 +107,65 @@ to public in GitHub package settings, or authenticate with `docker login ghcr.io
 
 ## Resized-image cache
 
-The optional in-memory LRU cache stores successful encoded resize results, not
-source images or libvips operation graphs. Enable it with `CACHE_MAX_SIZE`.
+The optional disk-backed LRU cache stores successful encoded resize results, not
+source images or libvips operation graphs. Enable it with `CACHE_MAX_SIZE` and a
+writable cache directory. There is no second in-memory payload cache.
 
 | Environment variable | Default | Purpose |
 | --- | --- | --- |
-| `CACHE_MAX_SIZE` | 0 | Maximum cache allocation bytes; e.g. `64MiB` or `512MB`; 0 disables caching, maximum `8GiB` |
+| `CACHE_MAX_SIZE` | 0 | Maximum cache-owned file bytes, including 32-byte headers; e.g. `30GiB` or `512MB`; 0 disables caching and all cache-directory I/O |
+| `CACHE_DIR` | `/var/cache/images` | Writable persistent directory; container UID 1000, GID 100 |
 | `CACHE_TTL_SECONDS` | 300 | Absolute lifetime from insertion; hits do not extend expiration |
 | `CACHE_CLEANUP_SECONDS` | 30 | Interval between expired-entry cleanup passes |
 
-Sizes accept nonnegative whole numbers with `B`, `KB`, `MB`, `GB`, `KiB`, `MiB`
-or `GiB` (case-insensitive), or raw bytes without a suffix. Decimal units use
-powers of 1000; binary units use powers of 1024. Fractions and unknown units are
+Sizes accept nonnegative whole numbers with `B`, SI units `KB` through `EB`, IEC
+units `KiB` through `EiB` (case-insensitive), or raw bytes without a suffix.
+Decimal units use powers of 1000; binary units use powers of 1024. Fractions,
+unknown units and products exceeding the platform's representable `usize` are
 rejected at startup. TTL and cleanup intervals are positive whole seconds.
 
-The cleaner starts with the service when caching is enabled and first runs after
-one cleanup interval. Lookups reject expired entries immediately, even before the
-next pass. Hits promote entries to most-recently-used; admission evicts the
-least-recently-used entries when space is needed. Oversized results are served
-without caching. Only successful results are cached.
+The cleaner first runs after one cleanup interval. Lookups reject entries at the
+exact expiration boundary, even before the next pass. Hits promote entries to
+most-recently-used; admission evicts least-recently-used entries when needed.
+Only successful results are admitted. Oversized results and failed admissions
+serve the original encoded output without caching, subject to the transient
+response memory budget.
 
 Keys include the source URL and normalized width, height, fit, format and quality.
 Equivalent parameter ordering, defaults and aliases share a result; distinct
-resize options do not. Hits skip origin downloads, decoding and encoding.
-Requests already reading an entry can finish safely if it expires or is evicted;
-their retained buffers still count toward the cache limit.
+resize options do not. Hits skip origin downloads, decoding and encoding, and
+stream from disk using a fixed 32 KiB response buffer rather than loading whole
+cached images into RAM. Misses write the original encoded buffer directly to an
+owned temporary file and atomically rename it after completion. Interrupted or
+failed writes remove their temporary files; startup removes owned orphan temps.
 
-Cache capacity is separate from `BUFFER_MEMORY_MB`, and includes retained payloads
-and entry metadata. Neither is a total RSS limit: budget for both, decoder scratch
-space, allocator overhead and HTTP workers. The cache is process-local, empty
-after restart, and does not revalidate source changes before TTL expiry. This TTL
-controls the server's memory cache, not downstream HTTP caches.
+Files persist across service restart. Startup restores the index and byte
+accounting, discards expired or invalid owned files, and orders retained entries
+by persisted insertion time (live access promotions are not persisted).
+Expiration uses the persisted nanosecond UTC insertion timestamp, not process
+uptime; backwards wall-clock jumps invalidate future-dated entries. Source
+changes are not revalidated before expiry. TTL controls this server's disk cache,
+not downstream HTTP caches.
+
+The byte limit includes admission reservations and evicted/expired files still
+open for active response leases. Such responses can finish safely and the bytes
+remain charged until their last lease closes. Headers count; filesystem block
+rounding and filesystem metadata do not. Index metadata is bounded separately to
+262144 entries, including pending admissions and pinned removed entries. At that
+bound LRU entries are evicted even if disk space remains; pinned capacity may
+force an uncached response. At most 1024 response leases and 64 simultaneous
+admissions open files, rather than keeping every cached entry's descriptor open.
+Deletion failures conservatively retain their charge; restart retries orphan
+cleanup. `BUFFER_MEMORY_SIZE` guards transient source and encoded miss responses;
+it does not charge disk hits. Decoder scratch, bounded index metadata and worker
+buffers still require RAM headroom.
+
+Mount persistent storage read/write at `CACHE_DIR` even with a read-only root
+filesystem. For a host bind mount, create the directory owned by UID 1000/GID 100.
+Use one running imgresize service per directory. Only recognizable
+`imgresize-v1-<SHA256>.cache` files and their owned temporary names are managed;
+unrelated files and legacy Stash thumbnails in a shared directory are ignored,
+never deleted, and do not count toward this cache's limit.
 
 ## Concurrency and memory
 
@@ -138,8 +183,8 @@ redirect responses close without draining potentially large bodies.
 | `RESIZE_WORKERS` | min(online CPUs, 4) | Maximum simultaneous image resizes |
 | `VIPS_CONCURRENCY` | 1 | libvips worker concurrency per resize |
 | `CONN_LIMIT` | 128 | Maximum accepted queued + active connections; excess connections close |
-| `BUFFER_MEMORY_MB` | 128 | Shared capacity budget for buffered sources and encoded responses |
-| `MAX_BODY_MB` | 50 | Maximum downloaded source bytes; not an upload setting |
+| `BUFFER_MEMORY_SIZE` | 128MiB | Shared capacity budget for buffered sources and encoded responses; e.g. `128MiB` or `512MB`; same SI/IEC syntax as `CACHE_MAX_SIZE`, max 8GiB |
+| `MAX_BODY_SIZE` | 50MiB | Maximum downloaded source bytes; not an upload setting; same SI/IEC syntax as `CACHE_MAX_SIZE`, max 1GiB |
 | `MAX_PIXELS` | 40000000 | Maximum source, requested output and actual output pixel count |
 
 Invalid configuration fails startup. For a CPU/memory-constrained deployment
@@ -147,7 +192,7 @@ serving up to 100 concurrent clients:
 
 ```sh
 PORT=8080 THREAD_POOL=8 RESIZE_WORKERS=2 VIPS_CONCURRENCY=1 \
-CONN_LIMIT=128 BUFFER_MEMORY_MB=128 MAX_BODY_MB=20 MAX_PIXELS=25000000 \
+CONN_LIMIT=128 BUFFER_MEMORY_SIZE=128MiB MAX_BODY_SIZE=20MiB MAX_PIXELS=25000000 \
 ./zig-out/bin/imgresize
 ```
 
@@ -205,9 +250,9 @@ and all enabled codec dependencies; this build does not claim to be fully static
 ## Zig-only tests and benchmarking
 
 ```sh
-nix-shell --run 'make test'
+direnv exec . make test
 # Or:
-nix-shell --run 'zig build test -Doptimize=Debug'
+direnv exec . zig build test -Doptimize=Debug
 ```
 
 The native integration suite launches the real server, generates image fixtures
@@ -227,8 +272,8 @@ Run the native benchmark against a representative image URL:
 Or build and run it directly:
 
 ```sh
-nix-shell --run 'zig build benchmark -Doptimize=ReleaseFast -- \
-  https://example.com/photo.jpg http://127.0.0.1:8080 --concurrency 100 --rounds 10'
+direnv exec . zig build benchmark -Doptimize=ReleaseFast -- \
+  https://example.com/photo.jpg http://127.0.0.1:8080 --concurrency 100 --rounds 10
 ```
 
 The optional Bash wrapper invokes the same Zig executable:

@@ -14,20 +14,26 @@ const Config = struct {
     buffer_bytes: usize,
     pixels: usize,
     cache_bytes: usize,
+    cache_dir: []const u8,
     cache_ttl_seconds: usize,
     cache_cleanup_seconds: usize,
     vips_concurrency: c_int,
 
     fn load(env: *const std.process.Environ.Map) !Config {
+        if (env.get("MAX_BODY_MB") != null or env.get("BUFFER_MEMORY_MB") != null) {
+            std.log.err("MAX_BODY_MB and BUFFER_MEMORY_MB were replaced by human-readable MAX_BODY_SIZE and BUFFER_MEMORY_SIZE (e.g. 50MiB)", .{});
+            return error.InvalidConfiguration;
+        }
         return .{
             .port = @intCast(try number(env, "PORT", 8080, 65535)),
             .http_workers = try number(env, "THREAD_POOL", 8, 128),
             .resize_workers = try number(env, "RESIZE_WORKERS", @min(std.Thread.getCpuCount() catch 1, 4), 128),
             .connections = try number(env, "CONN_LIMIT", 128, 65535),
-            .source_bytes = (try number(env, "MAX_BODY_MB", 50, 1024)) * 1024 * 1024,
-            .buffer_bytes = (try number(env, "BUFFER_MEMORY_MB", 128, 8192)) * 1024 * 1024,
+            .source_bytes = try byteSize(env, "MAX_BODY_SIZE", 50 * 1024 * 1024, 1024 * 1024 * 1024),
+            .buffer_bytes = try byteSize(env, "BUFFER_MEMORY_SIZE", 128 * 1024 * 1024, 8192 * 1024 * 1024),
             .pixels = try number(env, "MAX_PIXELS", 40000000, std.math.maxInt(c_int)),
             .cache_bytes = try cacheSize(env.get("CACHE_MAX_SIZE") orelse "0"),
+            .cache_dir = env.get("CACHE_DIR") orelse "/var/cache/images",
             .cache_ttl_seconds = try number(env, "CACHE_TTL_SECONDS", 300, std.math.maxInt(i64)),
             .cache_cleanup_seconds = try number(env, "CACHE_CLEANUP_SECONDS", 30, std.math.maxInt(i64)),
             .vips_concurrency = @intCast(try number(env, "VIPS_CONCURRENCY", 1, 128)),
@@ -43,10 +49,24 @@ const Config = struct {
     }
 
     fn cacheSize(text: []const u8) !usize {
-        return parseCacheSize(text) catch {
-            std.log.err("invalid CACHE_MAX_SIZE (expected 0..8GiB, e.g. 64MiB or 512MB)", .{});
+        return parseSize(text) catch {
+            std.log.err("invalid CACHE_MAX_SIZE (expected whole bytes or SI/IEC units within usize, e.g. 30GiB)", .{});
             return error.InvalidConfiguration;
         };
+    }
+
+    fn byteSize(env: *const std.process.Environ.Map, name: []const u8, default: usize, maximum: usize) !usize {
+        const text = env.get(name) orelse return default;
+        if (text.len == 0) return default;
+        const value = parseSize(text) catch {
+            std.log.err("invalid {s} (expected whole bytes or SI/IEC units 1..{d}, e.g. 50MiB)", .{ name, maximum });
+            return error.InvalidConfiguration;
+        };
+        if (value == 0 or value > maximum) {
+            std.log.err("invalid {s} (expected whole bytes or SI/IEC units 1..{d}, e.g. 50MiB)", .{ name, maximum });
+            return error.InvalidConfiguration;
+        }
+        return value;
     }
 
     fn invalid(name: []const u8, maximum: usize) error{InvalidConfiguration} {
@@ -55,7 +75,7 @@ const Config = struct {
     }
 };
 
-fn parseCacheSize(text: []const u8) error{InvalidSize}!usize {
+fn parseSize(text: []const u8) error{InvalidSize}!usize {
     const value = std.mem.trim(u8, text, " \t\r\n");
     if (value.len == 0) return 0;
     var end: usize = 0;
@@ -71,17 +91,27 @@ fn parseCacheSize(text: []const u8) error{InvalidSize}!usize {
         1000 * 1000
     else if (std.ascii.eqlIgnoreCase(unit, "GB"))
         1000 * 1000 * 1000
+    else if (std.ascii.eqlIgnoreCase(unit, "TB"))
+        1000 * 1000 * 1000 * 1000
+    else if (std.ascii.eqlIgnoreCase(unit, "PB"))
+        1000 * 1000 * 1000 * 1000 * 1000
+    else if (std.ascii.eqlIgnoreCase(unit, "EB"))
+        1000 * 1000 * 1000 * 1000 * 1000 * 1000
     else if (std.ascii.eqlIgnoreCase(unit, "KiB"))
         1024
     else if (std.ascii.eqlIgnoreCase(unit, "MiB"))
         1024 * 1024
     else if (std.ascii.eqlIgnoreCase(unit, "GiB"))
         1024 * 1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(unit, "TiB"))
+        1024 * 1024 * 1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(unit, "PiB"))
+        1024 * 1024 * 1024 * 1024 * 1024
+    else if (std.ascii.eqlIgnoreCase(unit, "EiB"))
+        1024 * 1024 * 1024 * 1024 * 1024 * 1024
     else
         return error.InvalidSize;
-    const maximum: usize = 8 * 1024 * 1024 * 1024;
-    if (amount > maximum / multiplier) return error.InvalidSize;
-    return amount * multiplier;
+    return std.math.mul(usize, amount, multiplier) catch error.InvalidSize;
 }
 
 const Job = struct {
@@ -173,11 +203,13 @@ const Service = struct {
         if (source_url.len == 0)
             return respond(&request, .bad_request, "missing url parameter\n", "text/plain", false);
         const options = parameters.options();
+        if (options.width == 0 and options.height == 0)
+            return respond(&request, .bad_request, "at least one resize axis must be positive\n", "text/plain", false);
         const key = if (self.config.cache_bytes != 0) response_cache.keyFor(source_url, options) else [_]u8{0} ** 32;
         if (if (self.config.cache_bytes != 0) self.cache.get(key, cacheNow(self.io)) else null) |cached| {
             var lease = cached;
             defer lease.deinit();
-            return respond(&request, .ok, lease.bytes(), options.format.contentType(), true);
+            return respondCached(&request, lease, options.format.contentType());
         }
 
         var source = fetch.download(&self.client, source_url, self.config.source_bytes, &self.budget) catch |err| switch (err) {
@@ -194,22 +226,17 @@ const Service = struct {
             break :blk image.resize(source.bytes(), options, self.config.pixels);
         };
         source.deinit();
-        var encoded: ?image.Encoded = resized catch {
+        var encoded: image.Encoded = resized catch {
             image.vips.vips_error_clear();
             return respond(&request, .bad_request, "decode/resize failed or exceeded pixel limit\n", "text/plain", false);
         };
-        defer if (encoded) |*owned| owned.deinit();
+        defer encoded.deinit();
         try self.io.checkCancel();
-        if (if (self.config.cache_bytes != 0) self.cache.insert(key, &encoded.?, cacheNow(self.io)) else null) |cached| {
-            encoded = null;
-            var lease = cached;
-            defer lease.deinit();
-            return respond(&request, .ok, lease.bytes(), options.format.contentType(), true);
-        }
-        if (!self.budget.reserve(encoded.?.bytes.len))
+        if (!self.budget.reserve(encoded.bytes.len))
             return respond(&request, .service_unavailable, "response memory budget exhausted; retry later\n", "text/plain", false);
-        defer self.budget.release(encoded.?.bytes.len);
-        try respond(&request, .ok, encoded.?.bytes, options.format.contentType(), true);
+        defer self.budget.release(encoded.bytes.len);
+        if (self.config.cache_bytes != 0) _ = try self.cache.insert(key, &encoded, cacheNow(self.io));
+        try respond(&request, .ok, encoded.bytes, options.format.contentType(), true);
     }
 };
 
@@ -239,16 +266,21 @@ const Parameters = struct {
     }
 
     fn options(self: Parameters) image.Options {
-        const width = dimension(self.width, 300);
+        const width = axis(self.width, 300);
         const format = self.format orelse self.alias orelse "jpeg";
         const fit = self.fit orelse "cover";
         return .{
             .width = width,
-            .height = dimension(self.height, width),
+            .height = axis(self.height, width),
             .quality = @intCast(@min(dimension(self.quality, 80), 100)),
             .fit = if (equal(fit, "contain")) .contain else if (equal(fit, "inside")) .inside else if (equal(fit, "outside")) .outside else if (equal(fit, "fill")) .fill else .cover,
             .format = if (equal(format, "webp")) .webp else if (equal(format, "png")) .png else if (equal(format, "avif")) .avif else .jpeg,
         };
+    }
+
+    fn axis(text: ?[]const u8, default: u32) u32 {
+        const value = std.fmt.parseInt(u32, text orelse return default, 10) catch return default;
+        return if (value <= 8192) value else default;
     }
 
     fn dimension(text: ?[]const u8, default: u32) u32 {
@@ -298,8 +330,28 @@ fn respond(request: *std.http.Server.Request, status: std.http.Status, body: []c
     });
 }
 
+fn respondCached(request: *std.http.Server.Request, lease: response_cache.Cache.Lease, content_type: []const u8) !void {
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = content_type },
+        .{ .name = "Cache-Control", .value = "public, max-age=86400" },
+    };
+    var body = try request.respondStreaming(&.{}, .{
+        .content_length = lease.size(),
+        .respond_options = .{ .status = .ok, .keep_alive = false, .extra_headers = &headers },
+    });
+    var buffer: [32768]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < lease.size()) {
+        const count = try lease.read(&buffer, offset);
+        if (count == 0) return error.TruncatedCacheFile;
+        try body.writer.writeAll(buffer[0..count]);
+        offset += count;
+    }
+    try body.end();
+}
+
 fn cacheNow(io: Io) i96 {
-    return Io.Clock.Timestamp.now(io, .awake).raw.toNanoseconds();
+    return Io.Clock.Timestamp.now(io, .real).raw.toNanoseconds();
 }
 
 fn deadlineAfter(io: Io, seconds: i64) Io.Clock.Timestamp {
@@ -358,7 +410,7 @@ pub fn main(init: std.process.Init) !void {
     var service: Service = .{
         .io = io,
         .config = config,
-        .cache = try response_cache.Cache.init(allocator, io, config.cache_bytes, config.cache_ttl_seconds),
+        .cache = try response_cache.Cache.init(allocator, io, config.cache_bytes, config.cache_ttl_seconds, config.cache_dir),
         .budget = .{ .limit = config.buffer_bytes },
         .slots = .{ .permits = config.resize_workers },
         .client = .{ .allocator = allocator, .io = io, .connection_pool = .{ .free_size = config.http_workers } },
@@ -439,18 +491,34 @@ test "cache keys normalize defaults aliases parameter order and fallbacks" {
     const left = try Parameters.parse("url=https%3A%2F%2Fexample.com%2Fa", &left_storage);
     const right = try Parameters.parse("q=80&fit=COVER&h=300&w=300&f=JPEG&url=https%3A%2F%2Fexample.com%2Fa", &right_storage);
     try std.testing.expectEqual(response_cache.keyFor(left.url.?, left.options()), response_cache.keyFor(right.url.?, right.options()));
-    const fallback = (Parameters{ .width = "bad", .height = "0", .quality = "bad", .format = "unknown", .fit = "unknown" }).options();
+    const fallback = (Parameters{ .width = "bad", .height = "bad", .quality = "bad", .format = "unknown", .fit = "unknown" }).options();
     try std.testing.expectEqual(response_cache.keyFor(left.url.?, left.options()), response_cache.keyFor(left.url.?, fallback));
 }
 
+test "explicit zero axes survive normalization and remain distinct cache keys" {
+    const width_only = (Parameters{ .width = "80", .height = "0" }).options();
+    const square = (Parameters{ .width = "80" }).options();
+    const height_only = (Parameters{ .width = "0", .height = "60" }).options();
+    try std.testing.expectEqual(@as(u32, 0), width_only.height);
+    try std.testing.expectEqual(@as(u32, 80), square.height);
+    try std.testing.expectEqual(@as(u32, 0), height_only.width);
+    try std.testing.expectEqual(@as(u32, 60), height_only.height);
+    try std.testing.expect(!std.mem.eql(u8, &response_cache.keyFor("source", width_only), &response_cache.keyFor("source", square)));
+    try std.testing.expect(!std.mem.eql(u8, &response_cache.keyFor("source", width_only), &response_cache.keyFor("source", height_only)));
+    const invalid = (Parameters{ .width = "0", .height = "0" }).options();
+    try std.testing.expectEqual(@as(u32, 0), invalid.width);
+    try std.testing.expectEqual(@as(u32, 0), invalid.height);
+}
+
 test "human-readable cache sizes distinguish decimal and binary units and reject overflow" {
-    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), try parseCacheSize("64MiB"));
-    try std.testing.expectEqual(@as(usize, 512000000), try parseCacheSize("512MB"));
-    try std.testing.expectEqual(@as(usize, 1024), try parseCacheSize(" 1 kib "));
-    try std.testing.expectEqual(@as(usize, 4096), try parseCacheSize("4096"));
-    try std.testing.expectEqual(@as(usize, 8 * 1024 * 1024 * 1024), try parseCacheSize("8GiB"));
-    try std.testing.expectEqual(@as(usize, 0), try parseCacheSize("0B"));
-    for ([_][]const u8{ "-1MiB", "1.5GB", "64MIB junk", "9GiB", "8589934593B", "18446744073709551616", "18446744073709551615GB", "MiB" }) |invalid| {
-        try std.testing.expectError(error.InvalidSize, parseCacheSize(invalid));
+    try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), try parseSize("64MiB"));
+    try std.testing.expectEqual(@as(usize, 512000000), try parseSize("512MB"));
+    try std.testing.expectEqual(@as(usize, 1024), try parseSize(" 1 kib "));
+    try std.testing.expectEqual(@as(usize, 4096), try parseSize("4096"));
+    try std.testing.expectEqual(@as(usize, 30 * 1024 * 1024 * 1024), try parseSize("30GiB"));
+    try std.testing.expectEqual(@as(usize, 1000000000000), try parseSize("1TB"));
+    try std.testing.expectEqual(@as(usize, 0), try parseSize("0B"));
+    for ([_][]const u8{ "-1MiB", "1.5GB", "64MIB junk", "18446744073709551616", "18446744073709551615GB", "MiB" }) |invalid| {
+        try std.testing.expectError(error.InvalidSize, parseSize(invalid));
     }
 }

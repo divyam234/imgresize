@@ -66,6 +66,10 @@ const Reply = struct {
 };
 
 fn exchange(port: u16, target: []const u8, method: std.http.Method, output: *?Reply) !void {
+    return exchangeWithPause(port, target, method, output, null, null);
+}
+
+fn exchangeWithPause(port: u16, target: []const u8, method: std.http.Method, output: *?Reply, entered: ?*Io.Event, release: ?*Io.Event) !void {
     var client: std.http.Client = .{ .allocator = a, .io = io };
     defer client.deinit();
     const url = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}{s}", .{ port, target });
@@ -81,6 +85,8 @@ fn exchange(port: u16, target: []const u8, method: std.http.Method, output: *?Re
         try request.sendBodiless();
     }
     var response = try request.receiveHead(&.{});
+    if (entered) |event| event.set(io);
+    if (release) |event| try event.wait(io);
     const bytes = try response.reader(&.{}).allocRemaining(a, .limited(8 * 1024 * 1024));
     errdefer a.free(bytes);
     if (response.head.content_length) |length| try std.testing.expectEqual(length, bytes.len);
@@ -125,15 +131,40 @@ fn listener() !Io.net.Server {
     return address.listen(io, .{ .kernel_backlog = 256 });
 }
 
+const CacheConfig = struct {
+    temporary: std.testing.TmpDir,
+    path: []u8,
+    max_size: []const u8,
+    ttl: []const u8,
+
+    fn init(max_size: []const u8, ttl: []const u8) !CacheConfig {
+        var temporary = std.testing.tmpDir(.{});
+        errdefer temporary.cleanup();
+        var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+        const length = try temporary.dir.realPath(io, &buffer);
+        return .{
+            .temporary = temporary,
+            .path = try a.dupe(u8, buffer[0..length]),
+            .max_size = max_size,
+            .ttl = ttl,
+        };
+    }
+
+    fn deinit(self: *CacheConfig) void {
+        a.free(self.path);
+        self.temporary.cleanup();
+    }
+};
+
 const Service = struct {
     child: std.process.Child,
     port: u16,
 
     fn start(small: bool, pixels: usize) !Service {
-        return startWithCache(small, pixels, false);
+        return startWithCache(small, pixels, null);
     }
 
-    fn startWithCache(small: bool, pixels: usize, cache: bool) !Service {
+    fn startWithCache(small: bool, pixels: usize, cache: ?*const CacheConfig) !Service {
         var reservation = try listener();
         const port = reservation.socket.address.getPort();
         reservation.deinit(io);
@@ -145,12 +176,14 @@ const Service = struct {
         try env.put("RESIZE_WORKERS", "2");
         try env.put("CONN_LIMIT", "256");
         try env.put("VIPS_CONCURRENCY", "1");
-        try env.put("MAX_BODY_MB", if (small) "1" else "8");
-        try env.put("BUFFER_MEMORY_MB", if (small) "1" else "64");
+        try env.put("MAX_BODY_SIZE", if (small) "1MiB" else "8MiB");
+        try env.put("BUFFER_MEMORY_SIZE", if (small) "1MiB" else "64MiB");
         try env.put("MAX_PIXELS", try std.fmt.bufPrint(&buffer, "{d}", .{pixels}));
-        if (cache) {
-            try env.put("CACHE_MAX_SIZE", "1MiB");
-            try env.put("CACHE_TTL_SECONDS", "1");
+        try env.put("CACHE_MAX_SIZE", "0");
+        if (cache) |config| {
+            try env.put("CACHE_DIR", config.path);
+            try env.put("CACHE_MAX_SIZE", config.max_size);
+            try env.put("CACHE_TTL_SECONDS", config.ttl);
             try env.put("CACHE_CLEANUP_SECONDS", "1");
         }
         var child = try std.process.spawn(io, .{
@@ -203,6 +236,7 @@ const Origin = struct {
     fixture: []const u8,
     alternate_fixture: []const u8 = &.{},
     use_alternate: std.atomic.Value(bool) = .init(false),
+    unavailable: std.atomic.Value(bool) = .init(false),
     fetched: std.atomic.Value(usize) = .init(0),
     tasks: Io.Group = .init,
     handlers: Io.Group = .init,
@@ -248,6 +282,10 @@ const Origin = struct {
         const request = try http.receiveHead();
         const path = request.head.target;
         _ = self.fetched.fetchAdd(1, .monotonic);
+        if (self.unavailable.load(.acquire)) {
+            try writer.interface.writeAll("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            return writer.interface.flush();
+        }
         const fixture = if (std.mem.eql(u8, path, "/mutable") and self.use_alternate.load(.acquire))
             self.alternate_fixture
         else
@@ -406,6 +444,74 @@ fn checkHttpContracts() !void {
     try bounded_pixels.stop();
 }
 
+fn singleAxisFixture(width: c_int, height: c_int, orientation: c_int) !Fixture {
+    var image: ?*vips.Image = null;
+    try std.testing.expectEqual(@as(c_int, 0), vips.vips_black(&image, width, height, "bands", @as(c_int, 3), null_arg));
+    defer vips.g_object_unref(image.?);
+    vips.vips_image_set_int(image.?, "orientation", orientation);
+    var data: ?*anyopaque = null;
+    var size: usize = 0;
+    errdefer vips.g_free(data);
+    try std.testing.expectEqual(@as(c_int, 0), vips.vips_jpegsave_buffer(image.?, &data, &size, null_arg));
+    return .{ .bytes = @as([*]u8, @ptrCast(data.?))[0..size] };
+}
+
+fn checkSingleAxisResizes() !void {
+    var cache = try CacheConfig.init("1MiB", "30");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 1000000, &cache);
+    defer service.deinit();
+    const sources = [_]struct { width: c_int, height: c_int, orientation: c_int = 1 }{
+        .{ .width = 160, .height = 240 },
+        .{ .width = 240, .height = 160 },
+        .{ .width = 240, .height = 160, .orientation = 6 },
+        .{ .width = 160, .height = 240, .orientation = 8 },
+    };
+    for (sources) |source| {
+        const fixture = try singleAxisFixture(source.width, source.height, source.orientation);
+        defer fixture.deinit();
+        // Confirm the fixture actually retained orientation through its encoder.
+        const decoded = vips.vips_image_new_from_buffer(fixture.bytes.ptr, fixture.bytes.len, "", null_arg) orelse return error.InvalidFixture;
+        defer vips.g_object_unref(decoded);
+        try std.testing.expectEqual(source.orientation, vips.vips_image_get_orientation(decoded));
+        var origin: Origin = .{ .server = try listener(), .fixture = fixture.bytes };
+        defer origin.deinit();
+        try origin.start();
+        const rotated = source.orientation >= 5 and source.orientation <= 8;
+        const width = if (rotated) source.height else source.width;
+        const height = if (rotated) source.width else source.height;
+        const cases = [_]struct { options: []const u8, width: c_int, height: c_int }{
+            .{ .options = "&w=80&h=0&fit=inside&format=png", .width = 80, .height = if (width == 160) 120 else 53 },
+            .{ .options = "&w=0&h=60&fit=inside&format=png", .width = if (height == 240) 40 else 90, .height = 60 },
+            .{ .options = "&w=800&h=0&fit=inside&format=png", .width = width, .height = height },
+            .{ .options = "&w=0&h=600&fit=inside&format=png", .width = width, .height = height },
+            .{ .options = "&w=80&fit=cover&format=png", .width = 80, .height = 80 },
+            .{ .options = "&w=80&h=0&fit=cover&format=png", .width = 80, .height = if (width == 160) 120 else 53 },
+            .{ .options = "&w=80&h=0&fit=fill&format=png", .width = 80, .height = if (width == 160) 120 else 53 },
+        };
+        for (cases) |row| {
+            const target = try targetFor(origin.port(), "/image", row.options);
+            defer a.free(target);
+            const reply = try call(service.port, target, .GET);
+            defer reply.deinit();
+            try expectImage(reply, row.width, row.height, .png);
+        }
+        const before = origin.fetched.load(.acquire);
+        const invalid_target = try targetFor(origin.port(), "/image", "&w=0&h=0");
+        defer a.free(invalid_target);
+        const invalid = try call(service.port, invalid_target, .GET);
+        defer invalid.deinit();
+        try std.testing.expectEqual(.bad_request, invalid.status);
+        try std.testing.expectEqual(before, origin.fetched.load(.acquire));
+        const limited_target = try targetFor(origin.port(), "/image", "&w=8192&h=0&fit=inside");
+        defer a.free(limited_target);
+        const limited = try call(service.port, limited_target, .GET);
+        defer limited.deinit();
+        try std.testing.expectEqual(.bad_request, limited.status);
+    }
+    try service.stop();
+}
+
 const ClientJob = struct {
     port: u16,
     target: []const u8,
@@ -413,9 +519,11 @@ const ClientJob = struct {
     failure: ?anyerror = null,
     start: ?*Io.Event = null,
     rejected: ?*Io.Event = null,
+    response_entered: ?*Io.Event = null,
+    response_release: ?*Io.Event = null,
     fn run(self: *ClientJob) Io.Cancelable!void {
         if (self.start) |gate| try gate.wait(io);
-        exchange(self.port, self.target, .GET, &self.reply) catch |err| {
+        exchangeWithPause(self.port, self.target, .GET, &self.reply, self.response_entered, self.response_release) catch |err| {
             self.failure = err;
             if (err == error.Canceled) return error.Canceled;
             if (self.rejected) |event| event.set(io);
@@ -482,7 +590,9 @@ fn checkResponseCache() !void {
     };
     defer origin.deinit();
     try origin.start();
-    var service = try Service.startWithCache(false, 2000000, true);
+    var cache = try CacheConfig.init("1MiB", "1");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 2000000, &cache);
     defer service.deinit();
 
     // Omitted defaults, option order, case, and the format alias normalize to
@@ -554,7 +664,9 @@ fn checkCacheOversizeBypass() !void {
     var origin: Origin = .{ .server = try listener(), .fixture = fixture.bytes };
     defer origin.deinit();
     try origin.start();
-    var service = try Service.startWithCache(false, 2000000, true);
+    var cache = try CacheConfig.init("1MiB", "30");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 2000000, &cache);
     defer service.deinit();
     const target = try targetFor(origin.port(), "/image", "&w=1024&h=1024&fit=fill&format=png");
     defer a.free(target);
@@ -568,6 +680,157 @@ fn checkCacheOversizeBypass() !void {
     // The bypass must not prevent smaller successful responses being cached.
     try cacheRequest(&service, &origin, "/small", "&w=80&h=60&fit=fill&format=png", 80, 60, .png, 3);
     try cacheRequest(&service, &origin, "/small", "&w=80&h=60&fit=fill&format=png", 80, 60, .png, 3);
+    try service.stop();
+}
+fn checkCachePersistence() !void {
+    const fixture = try Fixture.init(false);
+    defer fixture.deinit();
+    const alternate = try Fixture.init(true);
+    defer alternate.deinit();
+    var origin: Origin = .{
+        .server = try listener(),
+        .fixture = fixture.bytes,
+        .alternate_fixture = alternate.bytes,
+    };
+    defer origin.deinit();
+    try origin.start();
+    var cache = try CacheConfig.init("1MiB", "5");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 2000000, &cache);
+    defer service.deinit();
+    const target = try targetFor(origin.port(), "/mutable", "&w=80&h=60&fit=contain&format=png");
+    defer a.free(target);
+    const inserted = try call(service.port, target, .GET);
+    defer inserted.deinit();
+    try expectImage(inserted, 80, 60, .png);
+    try std.testing.expectEqual(@as(usize, 1), origin.fetched.load(.acquire));
+    try Io.sleep(io, .fromMilliseconds(2000), .awake);
+    try service.stop();
+
+    // A fresh process cannot reconstruct the image from the blocked origin.
+    // The directory belongs to this scenario, not either process lifetime.
+    origin.unavailable.store(true, .release);
+    origin.use_alternate.store(true, .release);
+    service = try Service.startWithCache(false, 2000000, &cache);
+    const restart_began = Io.Clock.awake.now(io);
+    const restarted = try call(service.port, target, .GET);
+    defer restarted.deinit();
+    try expectImage(restarted, 80, 60, .png);
+    try std.testing.expectEqualSlices(u8, inserted.bytes, restarted.bytes);
+    try std.testing.expectEqual(@as(usize, 1), origin.fetched.load(.acquire));
+
+    // Cross the original insertion TTL but stay inside a wrongly reset TTL.
+    // A restarted cache must not serve expired data, even on origin failure.
+    try Io.sleep(io, .fromMilliseconds(3200), .awake);
+    try std.testing.expect(restart_began.durationTo(Io.Clock.awake.now(io)).toSeconds() < 5);
+    const expired = try call(service.port, target, .GET);
+    defer expired.deinit();
+    try std.testing.expectEqual(.bad_gateway, expired.status);
+    try std.testing.expectEqual(@as(usize, 2), origin.fetched.load(.acquire));
+    origin.unavailable.store(false, .release);
+    try cacheRequest(&service, &origin, "/mutable", "&w=80&h=60&fit=contain&format=png", 60, 60, .png, 3);
+    try cacheRequest(&service, &origin, "/mutable", "&w=80&h=60&fit=contain&format=png", 60, 60, .png, 3);
+    try service.stop();
+}
+
+fn checkCacheEvictionConcurrency() !void {
+    const fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    var origin: Origin = .{ .server = try listener(), .fixture = fixture.bytes };
+    defer origin.deinit();
+    try origin.start();
+    var cache = try CacheConfig.init("4MiB", "30");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 2000000, &cache);
+    defer service.deinit();
+    const target = try targetFor(origin.port(), "/evicted", "&w=1024&h=1024&fit=fill&format=png");
+    defer a.free(target);
+    const replacement_target = try targetFor(origin.port(), "/replacement", "&w=1024&h=1024&fit=fill&format=png");
+    defer a.free(replacement_target);
+    const warmed = try call(service.port, target, .GET);
+    defer warmed.deinit();
+    try expectImage(warmed, 1024, 1024, .png);
+    try std.testing.expect(warmed.bytes.len < 4 * 1024 * 1024 - 32);
+    // Derive a one-file capacity from the actual encoded output, so this is
+    // independent of codec compression changes while still forcing eviction.
+    try service.stop();
+    var size_buffer: [32]u8 = undefined;
+    cache.max_size = try std.fmt.bufPrint(&size_buffer, "{d}", .{warmed.bytes.len + warmed.bytes.len / 2 + 32});
+    service = try Service.startWithCache(false, 2000000, &cache);
+    var gate: Io.Event = .unset;
+    var jobs: [16]ClientJob = undefined;
+    for (&jobs) |*job| job.* = .{ .port = service.port, .target = target, .start = &gate };
+    var response_entered: Io.Event = .unset;
+    var response_release: Io.Event = .unset;
+    jobs[0].response_entered = &response_entered;
+    jobs[0].response_release = &response_release;
+    defer for (&jobs) |*job| job.deinit();
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    for (&jobs) |*job| try group.concurrent(io, ClientJob.run, .{job});
+    gate.set(io);
+    try bounded(awaitEvent, .{&response_entered}, 10);
+    const competing = try call(service.port, replacement_target, .GET);
+    defer competing.deinit();
+    try expectImage(competing, 1024, 1024, .png);
+    response_release.set(io);
+    try bounded(awaitGroup, .{&group}, 35);
+    for (&jobs) |*job| {
+        if (job.failure) |failure| return failure;
+        try expectImage(job.reply.?, 1024, 1024, .png);
+        try std.testing.expectEqualSlices(u8, warmed.bytes, job.reply.?.bytes);
+    }
+    // Leases may cause admission bypass; after readers finish, replacement
+    // insertion must evict the old entry and the next replacement must hit.
+    const replacement = try call(service.port, replacement_target, .GET);
+    defer replacement.deinit();
+    try expectImage(replacement, 1024, 1024, .png);
+    const settled_count = origin.fetched.load(.acquire);
+    try cacheRequest(&service, &origin, "/replacement", "&w=1024&h=1024&fit=fill&format=png", 1024, 1024, .png, settled_count);
+    try cacheRequest(&service, &origin, "/evicted", "&w=1024&h=1024&fit=fill&format=png", 1024, 1024, .png, settled_count + 1);
+    try service.stop();
+}
+
+fn checkCacheCleanupStreaming() !void {
+    const fixture = try Fixture.init(true);
+    defer fixture.deinit();
+    var origin: Origin = .{ .server = try listener(), .fixture = fixture.bytes };
+    defer origin.deinit();
+    try origin.start();
+    var cache = try CacheConfig.init("4MiB", "1");
+    defer cache.deinit();
+    var service = try Service.startWithCache(false, 2000000, &cache);
+    defer service.deinit();
+    const target = try targetFor(origin.port(), "/cleanup", "&w=1024&h=1024&fit=fill&format=png");
+    defer a.free(target);
+    const warmed = try call(service.port, target, .GET);
+    defer warmed.deinit();
+    try expectImage(warmed, 1024, 1024, .png);
+    var entered: Io.Event = .unset;
+    var release: Io.Event = .unset;
+    var job: ClientJob = .{
+        .port = service.port,
+        .target = target,
+        .response_entered = &entered,
+        .response_release = &release,
+    };
+    defer job.deinit();
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, ClientJob.run, .{&job});
+    try bounded(awaitEvent, .{&entered}, 10);
+    try std.testing.expectEqual(@as(usize, 1), origin.fetched.load(.acquire));
+    // Keep the response reader paused through expiry and periodic cleanup.
+    try Io.sleep(io, .fromMilliseconds(2200), .awake);
+    const fresh = try call(service.port, target, .GET);
+    defer fresh.deinit();
+    try expectImage(fresh, 1024, 1024, .png);
+    try std.testing.expectEqual(@as(usize, 2), origin.fetched.load(.acquire));
+    release.set(io);
+    try bounded(awaitGroup, .{&group}, 10);
+    if (job.failure) |failure| return failure;
+    try expectImage(job.reply.?, 1024, 1024, .png);
+    try std.testing.expectEqualSlices(u8, warmed.bytes, job.reply.?.bytes);
     try service.stop();
 }
 
@@ -704,9 +967,13 @@ test "native service codecs, HTTP contracts, response cache, resource limits, 10
     vips.vips_concurrency_set(1);
     vips.vips_cache_set_max(0);
     try checkHttpContracts();
+    try checkSingleAxisResizes();
     try checkConcurrentResizes();
     try checkResponseCache();
     try checkCacheOversizeBypass();
+    try checkCachePersistence();
+    try checkCacheEvictionConcurrency();
+    try checkCacheCleanupStreaming();
     try checkSourceBudget();
     try checkResponseBudget();
     try checkDeadlinesAndShutdown();
